@@ -1,0 +1,27 @@
+# ── Python ──────────────────────────
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── 环境变量 ────────────────────────
+.env
+.claude/settings.local.json
+
+# ── 数据 / 模型 ──────────────────────
+bge-small-zh/
+data/
+
+# ── IDE ─────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── 系统 ────────────────────────────
+.DS_Store
+Thumbs.db
+*.log

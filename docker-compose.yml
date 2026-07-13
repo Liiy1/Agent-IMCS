@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.4.5
+    container_name: medical-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: medical_consult
+      MYSQL_USER: medical_user
+      MYSQL_PASSWORD: medical_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: bitnamilegacy/redis:8.0
+    container_name: medical-redis
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/bitnamilegacy/redis/data
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: medical-chroma
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  backend:
+    build: ./backend
+    container_name: medical-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: mysql+asyncmy://medical_user:medical_pass@mysql:3306/medical_consult
+      REDIS_URL: redis://redis:6379/0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}   # 从宿主机环境变量传入
+      EMBEDDING_MODEL_PATH: /app/bge-small-zh  # 容器内模型路径
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      chroma:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  redis_data:
+  chroma_data:
