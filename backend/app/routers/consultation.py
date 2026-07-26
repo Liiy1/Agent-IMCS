@@ -3,11 +3,58 @@ from pydantic import BaseModel
 from typing import Optional, List
 import uuid
 import logging
+import time
+import statistics
+from collections import deque
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.session_service import SessionService, VersionConflict, SessionNotFound
+from app.services.llm_service import llm_tracker
+
+
+# ── 延迟统计 ────────────────────────────────────────────
+# 全局 LatencyTracker，请求完成后记录延迟
+class LatencyTracker:
+    def __init__(self, window=5000):
+        self._latencies = deque(maxlen=window)
+
+    def record(self, seconds: float):
+        self._latencies.append(seconds * 1000)  # 转 ms
+
+    def stats(self):
+        if not self._latencies:
+            return {}
+        vals = sorted(self._latencies)
+        n = len(vals)
+        return {
+            "count": n,
+            "avg_ms": sum(vals) / n,
+            "min_ms": vals[0],
+            "p50_ms": vals[int(n * 0.50)],
+            "p90_ms": vals[int(n * 0.90)],
+            "p95_ms": vals[int(n * 0.95)],
+            "p99_ms": vals[int(n * 0.99)],
+            "max_ms": vals[-1],
+        }
+
+    def report(self):
+        s = self.stats()
+        if not s:
+            return "（尚无数据）"
+        return (
+            f"请求次数={s['count']}, "
+            f"平均={s['avg_ms']:.0f}ms, "
+            f"P50={s['p50_ms']:.0f}ms, "
+            f"P90={s['p90_ms']:.0f}ms, "
+            f"P95={s['p95_ms']:.0f}ms, "
+            f"P99={s['p99_ms']:.0f}ms, "
+            f"最大={s['max_ms']:.0f}ms"
+        )
+
+# 全局实例（在模块级别共享）
+request_tracker = LatencyTracker()
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +77,7 @@ class ConsultResponse(BaseModel):
     urgency_level: str
     is_complete: bool
     user_token: str
+    reflection_rounds: int = 0  # 反思轮次（0=未触发，1=初版通过，2+=精炼后）
 
 
 class MessageItem(BaseModel):
@@ -64,6 +112,8 @@ async def consult(
     svc: SessionService = Depends(get_session_service),
 ):
     """问诊对话入口 — 带持久化状态保存/恢复"""
+    _t0 = time.monotonic()
+
     # 1) 参数校验
     if not request.user_token:
         raise HTTPException(status_code=400, detail="user_token 是必填参数")
@@ -130,13 +180,34 @@ async def consult(
     except Exception as e:
         logger.error("消息持久化失败: %s", e)
 
-    # 6) 返回结果
+    # 6) 计时 + 返回结果
+    elapsed = time.monotonic() - _t0
+    request_tracker.record(elapsed)
+
+    reflection_round = final_state.get("reflection_round", 0)
+    reflection_score = final_state.get("reflection_score", 0)
+    logger.info(
+        "LATENCY session=%s duration=%.3fs next_action=%s symptoms=%d urgency=%s "
+        "reflect_round=%d reflect_score=%d",
+        session_id, elapsed,
+        final_state.get("next_action", "?"),
+        len(final_state.get("collected_symptoms", [])),
+        final_state.get("urgency_level", "?"),
+        reflection_round, reflection_score,
+    )
+    # 每 50 次输出一次聚合统计
+    if request_tracker.stats().get("count", 0) % 50 == 0:
+        logger.info("LATENCY_SUMMARY %s", request_tracker.report())
+        from app.agent.nodes import reflection_tracker
+        logger.info("REFLECTION_SUMMARY %s", reflection_tracker.report())
+
     return ConsultResponse(
         session_id=session_id,
         response=final_state.get("report", ""),
         urgency_level=final_state.get("urgency_level", "low"),
         is_complete=final_state.get("is_complete", False),
         user_token=request.user_token,
+        reflection_rounds=reflection_round,
     )
 
 
@@ -157,4 +228,25 @@ async def get_history(
         session_id=session_id,
         user_token=user_token,
         messages=[MessageItem(**m) for m in messages],
+    )
+
+
+# ── 性能统计（仅调试用，不在 OpenAPI 文档中暴露） ─────────
+
+from pydantic import BaseModel as PM
+
+class StatsResponse(PM):
+    request_stats: dict
+    llm_stats: dict
+
+@router.get("/stats", include_in_schema=False)
+async def get_stats():
+    """获取请求延迟和 LLM 调用统计"""
+    return StatsResponse(
+        request_stats=request_tracker.stats(),
+        llm_stats={
+            "extract_symptom": llm_tracker.stats("extract_symptom"),
+            "analyze_diagnosis": llm_tracker.stats("analyze_diagnosis"),
+            "generate_report": llm_tracker.stats("generate_report"),
+        },
     )

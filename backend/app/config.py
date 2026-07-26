@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # 跨域白名单
     ALLOWED_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
 
+    # 反思机制配置
+    REFLECTION_ENABLED: bool = True       # 总开关
+    REFLECTION_MAX_ROUNDS: int = 2        # 最大分析轮次（含初版，即最多 1 次精炼）
+    REFLECTION_PASS_THRESHOLD: int = 3    # 最低通过分数（1-5 评分制）
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -2,6 +2,11 @@ from typing import Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from app.agent.state import ConsultationState
 from app.agent.nodes import ConsultationNodes
+from app.config import settings
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ConsultationGraph:
@@ -15,31 +20,40 @@ class ConsultationGraph:
         workflow.add_node("collect", self.nodes.collect_symptoms)
         workflow.add_node("retrieve", self.nodes.retrieve_knowledge)
         workflow.add_node("analyze", self.nodes.analyze_symptoms)
+        workflow.add_node("reflect", self.nodes.reflect_analysis)
         workflow.add_node("generate_report", self.nodes.generate_report)
 
         workflow.set_entry_point("collect")
 
-        # 条件边：根据 collect 结果决定是追问结束还是继续
+        # collect → ask (END) 或 continue (retrieve)
         workflow.add_conditional_edges(
             "collect",
             self.should_continue,
-            {
-                "ask": END,                # 需要追问，直接结束
-                "continue": "retrieve"     # 信息足够，进入 RAG 检索
-            }
+            {"ask": END, "continue": "retrieve"},
         )
 
         workflow.add_edge("retrieve", "analyze")
-        workflow.add_edge("analyze", "generate_report")
+        workflow.add_edge("analyze", "reflect")
+
+        # reflect → 精炼循环或生成报告
+        workflow.add_conditional_edges(
+            "reflect",
+            self.should_reflect,
+            {"refine": "analyze", "continue": "generate_report"},
+        )
+
         workflow.add_edge("generate_report", END)
 
         return workflow.compile()
 
     def should_continue(self, state: ConsultationState) -> str:
-        """判断是否继续工作流"""
-        if state.get("next_action") == "ask":
-            return "ask"
-        return "continue"
+        """判断 collect 后是否继续（无变化，保持原有逻辑）"""
+        return state.get("next_action", "ask")
+
+    def should_reflect(self, state: ConsultationState) -> str:
+        """根据反思结果决定：精炼分析 或 生成报告"""
+        next_action = state.get("next_action", "continue")
+        return next_action
 
     async def run(
         self,
@@ -47,7 +61,7 @@ class ConsultationGraph:
         user_message: str,
         accumulated_state: Optional[Dict[str, Any]] = None,
     ) -> ConsultationState:
-        """执行问诊工作流
+        """执行问诊工作流（含反思机制）
 
         Args:
             session_id: 会话 ID
@@ -71,7 +85,12 @@ class ConsultationGraph:
             "report": "",
             "next_action": "",
             "is_complete": False,
-            "error": ""
+            "error": "",
+            # 反思字段初始值
+            "reflection_feedback": "",
+            "reflection_score": 0,
+            "reflection_round": 0,
+            "reflection_passed": False,
         }
 
         final_state: ConsultationState = await self.graph.ainvoke(initial_state)

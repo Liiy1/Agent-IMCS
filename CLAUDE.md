@@ -63,8 +63,8 @@ backend/
 │   ├── models.py            # ORM: Conversation, Message, ConversationState
 │   ├── agent/
 │   │   ├── state.py         # ConsultationState TypedDict (LangGraph state schema)
-│   │   ├── graph.py         # ConsultationGraph — 4-node state machine
-│   │   └── nodes.py         # collect → retrieve → analyze → generate_report
+│   │   ├── graph.py         # ConsultationGraph — 5-node with reflection loop
+│   │   └── nodes.py         # collect → retrieve → analyze → reflect → generate_report
 │   ├── rag/
 │   │   └── retriever.py     # ChromaDB (PersistentClient) + bge-small-zh + RRF fusion
 │   ├── routers/
@@ -80,16 +80,35 @@ backend/
 └── Dockerfile
 ```
 
-### LangGraph Consultation Workflow
+### LangGraph Consultation Workflow (含反思闭环)
 
-The core is a 4-node state graph in `app/agent/`:
+The core is a **5-node state graph with a reflection loop** in `app/agent/`:
 
 1. **collect** — LLM extracts symptoms + medical history from user message, enriches accumulated state
 2. **retrieve** — Hybrid RAG: vector + jieba keyword search → RRF fusion → top-5 medical docs
 3. **analyze** — LLM produces diagnosis, urgency level (low/medium/high/emergency), recommended department
-4. **generate_report** — LLM writes structured markdown report
+4. **reflect** — LLM-as-judge: scores analysis quality (1–5) across consistency, completeness, and medical accuracy
+5. **generate_report** — LLM writes structured markdown report
 
-A conditional edge after `collect` checks: if <3 symptoms and no history recorded → return `next_action: "ask"` (prompt user for more info, end workflow). Otherwise → continue to retrieval.
+**条件边 × 2：**
+- `collect` 后：若 <3 症状且无病史 → `next_action: "ask"`（追问用户，结束本轮）；否则 → 继续检索
+- `reflect` 后：若质量评分 ≥ 阈值（默认 3 分）→ 通过，生成报告；若不达标且轮次未耗尽 → 回 `analyze` 精炼（带上反思反馈）；轮次用尽仍不达标 → 强制出报告，追加"⚠️ 建议人工复核"声明
+
+```
+collect → (条件边: 症状是否充分?)
+    ├── ask → END
+    └── continue → retrieve → analyze → reflect → (条件边: 质量是否达标?)
+                                        ↑             ├── refine ────┘
+                                        │             └── continue → generate_report → END
+                                        └── 最多 REFLECTION_MAX_ROUNDS 轮 ──┘
+```
+
+**配置项**（`config.py`）：
+- `REFLECTION_ENABLED` — 总开关
+- `REFLECTION_MAX_ROUNDS` — 最大精炼轮次（默认 2）
+- `REFLECTION_PASS_THRESHOLD` — 最低通过分数（默认 3/5）
+
+**故障降级**：LLM 反射调用失败时保守返回通过值，不阻塞工作流。
 
 ### Multi-Turn Conversation
 
