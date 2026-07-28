@@ -1,4 +1,14 @@
+# Agent 工作流程图
 
+> 对应 `backend/app/agent/graph.py` + `backend/app/agent/nodes.py`
+
+本文档描述 LangGraph 五节点状态机的工作流程，包括条件边、反思闭环、MCP 工具调用和多轮追问。
+
+---
+
+## 一、总体工作流
+
+```
                             ┌──────────────────┐
                             │    初始状态       │
                             │  session_id       │
@@ -11,6 +21,7 @@
                       │                              │
                       │  输入：用户消息 + 累积状态     │
                       │  动作：LLM 提取症状/病史       │
+                      │  + MCP 工具预检 + LLM 工具决策 │ ← MCP 集成
                       │  输出：更新症状列表 + 病史     │
                       └──────────┬───────────────────┘
                                  │
@@ -39,6 +50,7 @@
                       │  ③ analyze_symptoms          │
                       │                              │
                       │  输入：症状 + 病史 + 知识     │
+                      │        + MCP 工具结果(可选)  │ ← MCP 集成
                       │        （精炼轮次：+反思反馈） │
                       │  动作：LLM 诊断分析           │
                       │  输出：诊断内容 + 紧急度      │
@@ -47,7 +59,6 @@
                                  ▼
                       ┌──────────────────────────────┐
                       │  ④ reflect_analysis          │
-                      │   （新增——反思评审节点）      │
                       │                              │
                       │  输入：诊断分析 + 紧急度 + 科室│
                       │  动作：LLM 评分 1-5 三个维度  │
@@ -56,7 +67,7 @@
                       └──────────┬───────────────────┘
                                  │
                       ┌──────────▼───────────────────┐
-                      │   条件判断 B（新增）          │
+                      │   条件判断 B                 │
                       │                              │
                       │  passed = True?              │
                       │                              │
@@ -88,107 +99,190 @@
                       │  reflection_round            │
                       │  reflection_score            │
                       └──────────────────────────────┘
+```
 
-  反思闭环精炼流程
+---
 
-  核心思想：LLM-as-Judge，让第二个 LLM 调用评审第一个 LLM 的输出质量。
+## 二、MCP 工具调用子步骤
 
-  评分维度：
-  1. 一致性 — 紧急程度是否与症状匹配？科室推荐是否合理？
-  2. 完整性 — 是否覆盖所有症状和可能病因？
-  3. 医学准确性 — 分析是否与医学知识一致？
+### collect 节点中的工具调用
 
-  决策逻辑（nodes.py:162-223 → reflect_analysis）：
-    score < threshold（默认 3） 且 轮次 < 最大轮次（默认 2）:
-      → next_action = "refine"  → 回 analyze 带上 feedback 精炼
+```
+用户输入："我头痛，能吃阿司匹林吗？"
+          │
+          ▼
+  ┌─────────────────────────────────────────┐
+  │ ① 关键词预检（_detect_and_call_tools）   │
+  │                                         │
+  │  "阿司匹林" → get_drug_info 调用         │
+  │  "报告"     → read_lab_report 调用       │
+  │  "上次"     → get_patient_history 调用   │
+  │                                         │
+  │  结果注入上下文，传给 LLM                │
+  └─────────────────────────────────────────┘
+          │
+          ▼
+  ┌─────────────────────────────────────────┐
+  │ ② LLM 提取症状（extract_symptom）        │
+  │                                         │
+  │  LLM 返回 tool_calls 请求：              │
+  │  {"tool":"get_drug_info",               │
+  │   "arguments":{"drug_name":"阿司匹林"}}  │
+  └─────────────────────────────────────────┘
+          │
+          ▼
+  ┌─────────────────────────────────────────┐
+  │ ③ 执行工具（_execute_llm_tool_calls）    │
+  │                                         │
+  │  调用 MCP → 药品信息返回                │
+  │  → 注入上下文 → 二次提取症状            │
+  └─────────────────────────────────────────┘
+```
 
-    score ≥ threshold:
-      → next_action = "continue" → 生成报告
+### analyze 节点中的工具调用
 
-    轮次 ≥ 最大轮次 且 score < threshold:
-      → next_action = "continue" → 强制出报告
-      → 报告开头追加 "⚠️ 建议人工复核" 声明
+```
+analyze 分析前检测（_detect_analyze_tool_needs）：
+  检查症状列表 + 用户消息中是否包含药品名称
+    ├─ 有 → MCP get_drug_info → 结果合并到 rag_context
+    └─ 无 → 跳过
+```
 
-  轮次计数：
-    round=0 → 初版分析
-    round=1 → 第一次精炼（最多 1 次）
-    REFLECTION_MAX_ROUNDS=2 表示最多 2 次分析尝试（初始 + 1 次精炼）
+---
 
-  多轮追问场景
+## 三、反思闭环精炼流程
 
-  第一轮：
-    用户："头痛"
-    → collect：提取到 ["头痛"], 无病史
-    → 条件判断 A：1个 < 3个 → 追问
-    → 返回：追问信息，本轮结束
+```
+核心思想：LLM-as-Judge，让第二个 LLM 调用评审第一个 LLM 的输出质量。
 
-  第二轮（accumulated_state 带入）：
-    用户："还有发烧和恶心，三天了"
-    → collect：在 ["头痛"] 基础上追加 ["发烧","恶心"], 仍无病史
-    → 条件判断 A：3个 ≥ 3个 → 继续
-    → retrieve → analyze → reflect
-    → 假设评分 = 2（不达标），round=0 < 2（可用轮次）
-    → 条件判断 B：回 analyze 精炼
-    → analyze（带上 feedback 精炼）→ reflect
-    → 假设评分 = 4（达标）→ generate_report
-    → 返回：完整诊断报告
+评分维度：
+1. 一致性 — 紧急程度是否与症状匹配？科室推荐是否合理？
+2. 完整性 — 是否覆盖所有症状和可能病因？
+3. 医学准确性 — 分析是否与医学知识一致？
 
-  状态累积过程：
-    round 1: collected_symptoms = ["头痛"]
-    round 2: collected_symptoms = ["头痛", "发烧", "恶心"]
+决策逻辑（nodes.py → reflect_analysis）：
+  score < threshold（默认 3） 且 轮次 < 最大轮次（默认 2）:
+    → next_action = "refine"  → 回 analyze 带上 feedback 精炼
 
-  条件边决策逻辑（代码对照）
+  score ≥ threshold:
+    → next_action = "continue" → 生成报告
 
-  # graph.py:49-56  — 条件判断 A
-  def should_continue(self, state):
-      return state.get("next_action", "ask")
-      # "ask" → END，追问
-      # "continue" → retrieve，继续
+  轮次 ≥ 最大轮次 且 score < threshold:
+    → next_action = "continue" → 强制出报告
+    → 报告开头追加 "⚠️ 建议人工复核" 声明
 
-  # graph.py:53-56  — 条件判断 B（新增）
-  def should_reflect(self, state):
-      return state.get("next_action", "continue")
-      # "refine" → analyze，精炼
-      # "continue" → generate_report，生成报告
+轮次计数：
+  round=0 → 初版分析
+  round=1 → 第一次精炼（最多 1 次）
+  REFLECTION_MAX_ROUNDS=2 表示最多 2 次分析尝试（初始 + 1 次精炼）
+```
 
-  # nodes.py:89-121 — collect 节点中的决策逻辑
-  if len(collected) < 3 and not existing:
-      state["next_action"] = "ask"      # 条件边 A → END
-  else:
-      state["next_action"] = "continue" # 条件边 A → retrieve
+---
 
-  # nodes.py:202-216 — reflect 节点中的决策逻辑
-  if passed:
-      next_action = "continue"           # 条件边 B → report
-  elif current_round >= max_rounds:
-      next_action = "continue"           # 条件边 B → report（强制）
-  else:
-      next_action = "refine"             # 条件边 B → analyze（精炼）
+## 四、多轮追问场景
 
-  追踪统计
+```
+第一轮：
+  用户："头痛"
+  → collect：提取到 ["头痛"], 无病史
+  → 条件判断 A：1个 < 3个 → 追问
+  → 返回：追问信息，本轮结束
 
-  ReflectionTracker（nodes.py:11-35）：
+第二轮（accumulated_state 带入）：
+  用户："还有发烧和恶心，三天了"
+  → collect：在 ["头痛"] 基础上追加 ["发烧","恶心"], 仍无病史
+  → 条件判断 A：3个 ≥ 3个 → 继续
+  → retrieve → analyze → reflect
+  → 假设评分 = 2（不达标），round=0 < 2（可用轮次）
+  → 条件判断 B：回 analyze 精炼
+  → analyze（带上 feedback 精炼）→ reflect
+  → 假设评分 = 4（达标）→ generate_report
+  → 返回：完整诊断报告
+
+状态累积过程：
+  round 1: collected_symptoms = ["头痛"]
+  round 2: collected_symptoms = ["头痛", "发烧", "恶心"]
+```
+
+---
+
+## 五、条件边决策逻辑（代码对照）
+
+### 条件判断 A（graph.py）
+
+```python
+def should_continue(self, state):
+    return state.get("next_action", "ask")
+    # "ask" → END，追问
+    # "continue" → retrieve，继续
+```
+
+### 条件判断 B（graph.py）
+
+```python
+def should_reflect(self, state):
+    return state.get("next_action", "continue")
+    # "refine" → analyze，精炼
+    # "continue" → generate_report，生成报告
+```
+
+### collect 节点中的决策逻辑（nodes.py）
+
+```python
+# collect_symptoms 中
+if len(collected) < 3 and not existing:
+    state["next_action"] = "ask"      # 条件边 A → END
+else:
+    state["next_action"] = "continue" # 条件边 A → retrieve
+```
+
+### reflect 节点中的决策逻辑（nodes.py）
+
+```python
+# reflect_analysis 中
+if passed:
+    next_action = "continue"           # 条件边 B → report
+elif current_round >= max_rounds:
+    next_action = "continue"           # 条件边 B → report（强制）
+else:
+    next_action = "refine"             # 条件边 B → analyze（精炼）
+```
+
+---
+
+## 六、追踪统计
+
+```python
+# ReflectionTracker（nodes.py）
+class ReflectionTracker:
     - total_reflections: 反思总次数
-    - refinements_triggered: 精炼触发次数
+    - refinements_triggered: 精炼触发率
     - scores: 评分分布
     - round_counts: 轮次分布
+```
 
-  与用户交互的完整对话流
+---
 
-  用户 ─── "头痛三天" ───→ 系统
+## 七、完整对话流示例
+
+```
+用户 ─── "头痛三天" ───→ 系统
                             │
                             ├─ collect → 提取到 ["头痛"]
+                            ├─ MCP 预检 → 未触发
                             ├─ 条件判断 A → 1 < 3 → 追问
                             │
-  系统 ─── "您已提到：头痛。     ───→ 用户
-           请再详细描述一下..."
+系统 ─── "您已提到：头痛。     ───→ 用户
+         请再详细描述一下..."
 
-  用户 ─── "还有发烧和恶心" ───→ 系统
+用户 ─── "还有发烧和恶心，能吃阿司匹林吗？" ───→ 系统
                             │
-                            ├─ collect → 累积到 ["头痛","发烧","恶心"]
+                            ├─ collect → MCP 预检: "阿司匹林" →
+                            │   get_drug_info → 结果注入上下文
+                            ├─ LLM 提取 → 累积到 ["头痛","发烧","恶心"]
                             ├─ 条件判断 A → 3 ≥ 3 → 继续
-                            ├─ retrieve → 检索知识库
-                            ├─ analyze → LLM 分析诊断（初版）
+                            ├─ retrieve → RAG 检索知识库
+                            ├─ analyze → LLM 分析诊断（含药品信息）
                             ├─ reflect → LLM 评审（评分 2/5，不达标）
                             ├─ 条件判断 B → round=0 < 2 → 精炼
                             ├─ analyze → LLM 精炼分析（带反馈）
@@ -196,4 +290,5 @@
                             ├─ 条件判断 B → 继续
                             ├─ report → 生成报告
                             │
-  系统 ─── [结构化诊断报告]  ───→ 用户
+系统 ─── [结构化诊断报告]  ───→ 用户
+```

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # 跨域白名单
     ALLOWED_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
 
+    # MCP 工具层配置
+    MCP_ENABLED: bool = True              # MCP 工具层总开关
+    MCP_SERVER_URL: str = "http://localhost:8001"  # MCP Server 地址（远程模式预留）
+
     # 反思机制配置
     REFLECTION_ENABLED: bool = True       # 总开关
     REFLECTION_MAX_ROUNDS: int = 2        # 最大分析轮次（含初版，即最多 1 次精炼）

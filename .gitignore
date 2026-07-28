@@ -14,6 +14,8 @@ build/
 # ── 数据 / 模型 ──────────────────────
 bge-small-zh/
 data/
+# MCP 药品 SQLite 数据库（自动生成）
+backend/app/mcp/server/drug_data.db
 
 # ── IDE ─────────────────────────────
 .idea/

@@ -94,25 +94,54 @@ class LLMService:
         return text.strip()
 
     async def extract_symptom(self, user_text: str) -> Dict[str, Any]:
-        """提取用户症状、病史（不含追问生成，后端自行控制追问逻辑）"""
+        """提取用户症状、病史，并判断是否需要调用外部工具
+
+        JSON 返回字段：
+        - symptoms: List[str] — 症状列表
+        - history: List[str] — 病史列表
+        - next_ask: 固定返回空字符串 ""
+        - tool_calls: (可选) List[Dict] — 如需额外查询可返回工具调用
+          每项含 {"tool": "工具名", "arguments": {参数字典}}
+          可用工具：get_drug_info, check_drug_interaction,
+                    get_patient_history, read_lab_report
+        """
         _t0 = time.monotonic()
         prompt = f"""
-从以下用户输入中提取所有症状和病史，以 JSON 格式输出。
-- symptoms: 字符串列表，列出所有身体不适（如头痛、发烧、咳嗽等）。
-- history: 字符串列表，列出所有病史、慢性病、用药史、过敏史等。
-- next_ask: 固定返回空字符串 ""。
+你是一位医疗问诊系统的症状提取助手。
+
+任务：
+1. 从用户输入中提取所有症状和病史。
+2. 判断是否需要调用外部工具获取更多信息。
+
+输出 JSON 格式：
+- "symptoms": 字符串列表，列出所有身体不适（如头痛、发烧、咳嗽等）。
+- "history": 字符串列表，列出所有病史、慢性病、用药史、过敏史等。
+- "next_ask": 固定返回空字符串 ""。
+- "tool_calls": （可选）若用户提到具体药品名称、检验报告文件、或历史就医记录，
+  且当前上下文中的信息不足以完成提取时，返回需调用的工具列表。
+  否则不返回此字段或返回空列表。
+
+可用工具（仅在用户明确提及相关场景时使用）：
+- get_drug_info: 用户询问药品作用、副作用时用，参数 {{"drug_name": "药品名"}}
+- check_drug_interaction: 用户询问两种药能否一起吃时用，参数 {{"drug_a": "药A", "drug_b": "药B"}}
+- get_patient_history: 用户提到"上次""以前""老毛病"等时用，参数 {{"patient_id": "患者ID"}}
+- read_lab_report: 用户提到"报告""化验单""血常规"时用，参数 {{"file_path": "文件路径"}}
+
 只输出 JSON，不要其他任何文本。
 
 示例输入："我头痛3天了，伴有恶心"
 输出：{{"symptoms": ["头痛", "恶心"], "history": [], "next_ask": ""}}
 
-示例输入："有点发烧，还有鼻塞"
-输出：{{"symptoms": ["发烧", "鼻塞"], "history": [], "next_ask": ""}}
+示例输入："有点发烧，还能吃阿司匹林吗？"
+输出：{{"symptoms": ["发烧"], "history": [], "next_ask": "", "tool_calls": [{{"tool": "get_drug_info", "arguments": {{"drug_name": "阿司匹林"}}}}]}}
+
+示例输入："我上次那个头痛的老毛病又犯了"
+输出：{{"symptoms": ["头痛"], "history": [], "next_ask": "", "tool_calls": [{{"tool": "get_patient_history", "arguments": {{"patient_id": "当前患者"}}}}]}}
 
 用户输入：{user_text}
 输出："""
         logger.info("extract_symptom user_text: %s", user_text)
-        logger.info("extract_symptom FULL PROMPT:\n%s", prompt)
+        logger.debug("extract_symptom FULL PROMPT:\n%s", prompt)
         try:
             res = await self._call_llm(prompt)
             res = self._clean_json_response(res)

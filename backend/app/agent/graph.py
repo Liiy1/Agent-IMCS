@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 class ConsultationGraph:
-    def __init__(self, llm_service, rag_retriever):
-        self.nodes = ConsultationNodes(llm_service, rag_retriever)
+    def __init__(self, llm_service, rag_retriever, mcp_client=None):
+        self.nodes = ConsultationNodes(llm_service, rag_retriever, mcp_client=mcp_client)
         self.graph = self._build_graph()
 
     def _build_graph(self):
